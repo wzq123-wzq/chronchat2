@@ -12,4 +12,4 @@ redis:
   password: ""
   DB: 0
   poolSize: 30
-  minIdleCome: 30
+  minIdleConns: 30

@@ -61,8 +61,13 @@
                 },
                 isDisable: true,
                 isLoadMore: false,
+                pullThreshold: 60,          // 下拉触发阈值(px),超过此值松手即触发加载
+                _pullStartY: 0,             // pointerdown 时的 Y 坐标
+                _pullDistance: 0,           // 当前下拉距离
+                _isPulling: false,          // 是否正在下拉中
                 start: 0,
                 end: 9,
+                loaded: 0,   // 当前会话已加载的历史消息条数(真实计数,翻页游标)
                 txtmsg: "",
                 panelstat: "kbord",
                 txtstat: "kbord",
@@ -150,7 +155,9 @@
 
             },
             mounted: function () {
-
+                // 滚动初始化和下拉手势只挂一次,避免每次点开好友重复挂监听器
+                this.initMuiScroll();
+                this.initPullToRefresh();
             },
             methods: {
                 initUser() {
@@ -274,7 +281,6 @@
                     //console.log(data.ismine,userId(),msg.userid)
                     data.user = user;
                     data.msg = msg;
-                    console.log(this.msglist)
                     if (isReverse) {
                         this.msglist = [data].concat(this.msglist);
                     } else {
@@ -293,8 +299,8 @@
                         if (!isReverse) {
                             let scroll = document.querySelector("#convo .mui-scroll-wrapper").offsetHeight;
                             let inner = document.querySelector("#convo .mui-scroll").offsetHeight;
-                            let y = scroll - inner - 80;
-                            let transform = document.querySelector("#convo .mui-scroll").style.transform;
+                            // 消息未溢出容器时 translateY(0) 从顶部自然排列;溢出才滚到底部显示最新消息
+                            let y = (inner > scroll) ? (scroll - inner - 80) : 0;
                             document.querySelector("#convo .mui-scroll").style.transform = 'translateY(' + y + 'px)';
                         } else {
                             document.querySelector("#convo .mui-scroll").style.transform = 'translateY(' + 0 + 'px)';
@@ -357,9 +363,158 @@
                 closePanel() {
                     this.panelstat = 'kbord';
                 },
+                // mui 滚动初始化(只执行一次,在 mounted 中调用)
+                initMuiScroll() {
+                    if (document.querySelector('#convo .mui-scroll-wrapper')._muiInited) return;
+                    document.querySelector('#convo .mui-scroll-wrapper')._muiInited = true;
+                    mui('.mui-scroll-wrapper').scroll({
+                        scrollY: true, //是否竖向滚动
+                        scrollX: false, //是否横向滚动
+                        startX: 0, //初始化时滚动至x
+                        startY: 0, //初始化时滚动至y
+                        indicators: true, //是否显示滚动条
+                        deceleration: 0.0006, //阻尼系数,系数越小滑动越灵敏
+                        bounce: true //是否启用回弹
+                    });
+                },
+                // 挂载 Pointer 手势实现下拉加载历史消息(只挂一次,在 mounted 中调用)
+                // 用 pointer 事件统一支持 鼠标拖动(PC调试) 和 触摸下拉(真机)
+                // 流程: pointerdown(触顶才进入) → pointermove(跟手位移+阻尼) → pointerup(回弹动画→触发请求)
+                initPullToRefresh() {
+                    var that = this;
+                    var wrapper = document.querySelector('#convo .mui-scroll-wrapper');
+                    var scrollInner = document.querySelector('#convo .mui-scroll');
+                    if (!wrapper || !scrollInner) return;
+                    if (wrapper._pullInited) return;
+                    wrapper._pullInited = true;
+                    // 禁用浏览器默认触摸手势(滚动/下拉刷新),滚动全部交给 mui 和本手势控制
+                    scrollInner.style.touchAction = 'none';
+
+                    // 判断当前 mui-scroll 是否在"顶部区域"(内容上边沿未被推离顶部)
+                    function isAtTop() {
+                        // Y >= 0 即视为在顶部:
+                        //   translateY(正数/0)  ← 消息少无滚动空间时 showmsg 的定位值
+                        //   translate3d(0,0,0)  ← 滚回顶部后 mui 的归位值
+                        // Y 为负数说明还在列表中部/底部,不允许触发下拉加载
+                        var transform = scrollInner.style.transform || '';
+                        var match3d = transform.match(/translate3d\(\d+px,\s*(-?\d+)px,\s*\d+\)/i);
+                        if (match3d && parseInt(match3d[1], 10) >= 0) return true;
+                        var matchY = transform.match(/translateY\((-?\d+)px\)/i);
+                        if (matchY && parseInt(matchY[1], 10) >= 0) return true;
+                        // 回退: 用 scrollTop 判断
+                        if (wrapper.scrollTop === 0) return true;
+                        return false;
+                    }
+
+                    wrapper.addEventListener('pointerdown', function (e) {
+                        if (that.win !== 'single' && that.win !== 'group') return;
+                        if (that.isLoadMore) return;
+                        // 只有已经在顶部了,才允许进入下拉模式
+                        if (!isAtTop()) return;
+                        that._pullStartY = e.clientY;
+                        that._pullDistance = 0;
+                        that._isPulling = true;
+                        // 捕获指针:即使鼠标移出元素,pointerup 也一定派发到 wrapper
+                        try { wrapper.setPointerCapture(e.pointerId); } catch (err) { }
+                    });
+
+                    wrapper.addEventListener('pointermove', function (e) {
+                        if (!that._isPulling) return;
+                        var dy = e.clientY - that._pullStartY;
+                        if (dy <= 0) {
+                            // 往上滑,回到 0,并退出下拉模式让 mui 接管正常滚动
+                            that._pullDistance = 0;
+                            that._isPulling = false;
+                            scrollInner.style.transition = 'none';
+                            scrollInner.style.transform = 'translate3d(0, 0px, 0)';
+                            return;
+                        }
+                        // 阻尼系数: 越往下越拉不动,体验更像微信
+                        var dampened = dy * 0.5;
+                        that._pullDistance = dampened;
+                        // 跟手位移
+                        scrollInner.style.transition = 'none';
+                        scrollInner.style.transform = 'translate3d(0, ' + dampened + 'px, 0)';
+                    });
+
+                    function endPull() {
+                        if (!that._isPulling) return;
+                        that._isPulling = false;
+                        var dist = that._pullDistance;
+                        that._pullDistance = 0;
+                        // 回弹到顶部位置
+                        scrollInner.style.transition = 'transform 0.25s ease-out';
+                        scrollInner.style.transform = 'translate3d(0, 0px, 0)';
+                        // 动画结束后必须清除 transition,否则残留会干扰 mui 后续滚动和 isAtTop 判断
+                        setTimeout(function () { scrollInner.style.transition = ''; }, 300);
+                        if (dist >= that.pullThreshold && !that.isLoadMore) {
+                            that.isLoadMore = true;
+                            // 翻页游标用真实已加载条数,而不是假设首拉拿满10条
+                            that.start = that.loaded;
+                            that.end = that.loaded + 1;
+                            // transitionend 可能不触发(距离为0或浏览器兼容问题),加 setTimeout 兜底
+                            var fired = false;
+                            var trigger = function () {
+                                if (fired) return;
+                                fired = true;
+                                that._loadMoreHistory();
+                            };
+                            scrollInner.addEventListener('transitionend', function onEnd() {
+                                scrollInner.removeEventListener('transitionend', onEnd);
+                                trigger();
+                            });
+                            setTimeout(trigger, 350); // 比 transition(250ms) 稍长
+                        }
+                    }
+                    wrapper.addEventListener('pointerup', endPull);
+                    wrapper.addEventListener('pointercancel', endPull);
+                },
+                // 下拉加载更早的历史消息(Redis 不够时后端会回查 MySQL 补货)
+                _loadMoreHistory() {
+                    var that = this;
+                    var targetId = this.msgcontext.TargetId;
+                    if (!targetId || targetId < 0) {
+                        this.isLoadMore = false;
+                        return;
+                    }
+                    // 用 TargetId 反查当前会话对象(私聊从 friends 找,群聊从 communitys 找)
+                    var userObj = null;
+                    if (this.msgcontext.Type === 1) {
+                        this.friends.map(function (item) { if (item.ID == targetId) userObj = item; });
+                    } else if (this.msgcontext.Type === 2) {
+                        this.communitys.map(function (item) { if (item.ID == targetId) userObj = item; });
+                    }
+                    post("user/redisMsg", {
+                        userIdA: userId(),
+                        userIdB: targetId,
+                        start: this.start,
+                        end: this.end,
+                        isRev: false
+                    }, function (res) {
+                        if (res.Total && res.Total.length > 0) {
+                            for (var i in res.Total) {
+                                that.showmsg(userObj, JSON.parse(res.Total[i]), true);
+                            }
+                            // 累计真实加载条数
+                            that.loaded += res.Total.length;
+                        } else {
+                            // 没有更早的消息了,给用户明确反馈
+                            mui.toast("没有更多历史消息了");
+                        }
+                        // 300ms 防抖解锁,避免连续触发
+                        setTimeout(function () {
+                            that.isLoadMore = false;
+                        }, 300);
+                    });
+                    // 兜底:即使请求异常回调未执行,2秒后强制解锁,防止下拉功能永久卡死
+                    setTimeout(function () {
+                        that.isLoadMore = false;
+                    }, 2000);
+                },
                 singlemsg: function (user) {
                     this.start = 0;
                     this.end = 9;
+                    this.loaded = 0;
                     if (this.isDisable) {
                         //首次读取某个用户的消息记录
                         if (this.isReadRedisMsg.filter(item => item === user.ID).length <= 0) {
@@ -368,6 +523,8 @@
                                 for (var i in res.Total) {
                                     this.showmsg(user, JSON.parse(res.Total[i]), false, true)
                                 }
+                                // 记录真实加载条数,作为下次下拉的翻页游标
+                                this.loaded = res.Total ? res.Total.length : 0;
                             }.bind(this))
                             this.isReadRedisMsg.push(user.ID)
                         }
@@ -379,41 +536,14 @@
                         this.otherAvatar = user.Avatar;
                         this.msgcontext.TargetId = parseInt(user.ID);
                         this.msgcontext.Type = 1;
-                        mui('.mui-scroll-wrapper').scroll({
-                            scrollY: true, //是否竖向滚动
-                            scrollX: false, //是否横向滚动
-                            startX: 0, //初始化时滚动至x
-                            startY: 0, //初始化时滚动至y
-                            indicators: true, //是否显示滚动条
-                            deceleration: 0.0006, //阻尼系数,系数越小滑动越灵敏
-                            bounce: true //是否启用回弹
-                        });
-                        //下拉获取历史消息记录
-                        document.querySelector('.mui-scroll-wrapper').addEventListener('scroll', (e) => {
-                            let translate = e.target.style?.transform?.match(/translate3d\(\d+px,\s*(\d+)px,\s*(\d+)px\)/i);
-                            if (translate && translate.length > 1) {
-                                if (translate[1] > 0 && this.isLoadMore == false) {
-                                    this.isLoadMore = true;
-                                    this.start = this.end + 1;
-                                    this.end = this.end + 2;
-                                    post("user/redisMsg", { userIdA: userId(), userIdB: user.ID, start: this.start, end: this.end, isRev: false }, function (res) {
-                                        //循环读取的消息记录 并显示
-                                        for (var i in res.Total) {
-                                            this.showmsg(user, JSON.parse(res.Total[i]), true)
-                                        }
-                                        setTimeout(() => {
-                                            this.isLoadMore = false;
-                                        }, 300);
-                                    }.bind(this))
-                                    this.isReadRedisMsg.push(user.ID)
-                                }
-                            }
-                        })
                     }
                 },
                 //群聊的初始化
                 groupmsg: function (group) {
                     if (this.isDisable) {
+                        this.start = 0;
+                        this.end = 9;
+                        this.loaded = 0;
                         this.setTimeFlag()
                         this.win = "group";
                         this.title = group.Name;

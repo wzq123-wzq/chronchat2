@@ -65,7 +65,7 @@ func InitRedis(ctx context.Context) {
 		Password:     viper.GetString("redis.password"),
 		DB:           viper.GetInt("redis.DB"),
 		PoolSize:     viper.GetInt("redis.poolSize"),
-		MinIdleConns: viper.GetInt("redis.minIdeConn"),
+		MinIdleConns: viper.GetInt("redis.minIdleConns"),
 	})
 
 	pong ,err :=Red.Ping(ctx).Result()
