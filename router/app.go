@@ -10,6 +10,7 @@ import (
 )
 
 func Router() *gin.Engine {
+	// 初始化路由
 	r := gin.Default()
 	// swagger
 	docs.SwaggerInfo.BasePath = ""
